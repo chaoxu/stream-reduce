@@ -23,7 +23,9 @@ def main() -> None:
     # and serializes work so OpenRouter rate limits are respected.
     worker = SimpleWorker([get_queue()], connection=get_redis())
     logging.getLogger(__name__).info("worker listening on queue '%s'", QUEUE_NAME)
-    worker.work(with_scheduler=False)
+    # RQ's scheduler releases retries with backoff from the scheduled registry.
+    # It runs separately while SimpleWorker still processes jobs serially here.
+    worker.work(with_scheduler=True)
 
 
 if __name__ == "__main__":

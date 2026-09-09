@@ -221,6 +221,10 @@ uv run ruff check .           # lint
 uv run ruff format .          # format
 ```
 
+The worker retry integration test starts its own `redis-server` on a temporary
+Unix socket, with isolated database files. Install `redis-server` to run it;
+otherwise that test is skipped.
+
 Live smoke tests (need real keys, run manually):
 
 ```bash
