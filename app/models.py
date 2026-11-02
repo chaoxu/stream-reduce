@@ -36,6 +36,7 @@ class TranscriptSource(str, Enum):
     native = "native"
     openrouter_whisper = "openrouter_whisper"
     gemini = "gemini"
+    mixed = "mixed"
 
 
 class StageName(str, Enum):

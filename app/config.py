@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     llm_model: str = "gemini-3.5-flash"
     llm_temperature: float = 0.2
 
+    # Direct Gemini audio route used when OpenRouter STT is unavailable. This
+    # must name a LiteLLM route that preserves multimodal audio content.
+    gemini_audio_model: str = "gemini-3.5-flash"
+
     # Speech-to-text via OpenRouter
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"

@@ -76,7 +76,7 @@ def process_item(item_id: int) -> None:
     """Run the full ingest -> transcribe -> summarize pipeline for one item."""
     from app.adapters.registry import get_adapter
     from app.pipeline.summarize import summarize_item
-    from app.pipeline.transcribe import transcribe_audio
+    from app.pipeline.transcribe import transcribe_audio, transcribe_via_gemini_audio
 
     settings = get_settings()
 
@@ -153,35 +153,34 @@ def process_item(item_id: int) -> None:
                     item.media_path = _relative_media_path(audio_path, settings)
                     s.add(item)
 
-        # Optional last-resort path: hand the audio straight to Gemini when no
-        # transcript is available and transcription is not configured.
+        # Optional last-resort path: transcribe the audio through a direct
+        # Gemini multimodal route when OpenRouter STT is not configured.
         use_gemini_audio = (
             native_segments is None
             and settings.enable_gemini_audio_fallback
             and not settings.openrouter_api_key
         )
         if use_gemini_audio:
-            from app.pipeline.summarize import summarize_via_gemini_audio
-
             with session_scope() as s:
                 item = s.get(Item, item_id)
-                item.status = ItemStatus.summarizing
+                item.status = ItemStatus.transcribing
+                expected_duration = item.duration_s or item.audio_duration_s
                 s.add(item)
             with session_scope() as s:
                 with StageTracker(
                     s, item_id, StageName.gemini_audio,
-                    provider="litellm", model=effective_llm_model(),
+                    provider="litellm", model=settings.gemini_audio_model,
                 ) as tracker:
-                    summarize_via_gemini_audio(s, item_id, audio_path, tracker)
-            with session_scope() as s:
-                item = s.get(Item, item_id)
-                item.status = ItemStatus.done
-                item.completed_at = _now()
-                s.add(item)
-            logger.info("process_item %s completed via gemini audio", item_id)
-            return
+                    result = transcribe_via_gemini_audio(
+                        audio_path, tracker, expected_duration=expected_duration
+                    )
+                    _store_transcript(
+                        s, item_id, result.language,
+                        TranscriptSource.gemini, result.segments,
+                    )
+            logger.info("process_item %s transcribed via gemini audio", item_id)
 
-        if native_segments is not None:
+        elif native_segments is not None:
             with session_scope() as s:
                 _store_transcript(s, item_id, native_lang, TranscriptSource.native, native_segments)
         else:

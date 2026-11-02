@@ -1,10 +1,13 @@
-"""OpenRouter speech-to-text with ffmpeg chunking, rate limiting, and 429 backoff."""
+"""Chunked speech-to-text through OpenRouter or a Gemini audio route."""
 
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import logging
 import random
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -103,6 +106,159 @@ def transcribe_audio(
 
     full_text = "\n".join(s["text"] for s in segments)
     return TranscribeResult(language=language, segments=segments, text=full_text)
+
+
+def transcribe_via_gemini_audio(
+    audio_path: str,
+    tracker: StageTracker | None = None,
+    expected_duration: float | None = None,
+) -> TranscribeResult:
+    """Transcribe chunked audio through a direct Gemini multimodal route.
+
+    This is the fallback for deployments without an OpenRouter STT key. It
+    deliberately uses the direct Gemini LiteLLM route: the local ``agy-high``
+    compatibility proxy accepts text only and drops ``input_audio`` content.
+    """
+    settings = get_settings()
+    model = settings.gemini_audio_model
+    limiter = RateLimiter(settings.transcribe_rate_limit)
+    prompt = (
+        "Transcribe this audio verbatim. Return only the spoken words, in the "
+        "original language, with no summary, headings, timestamps, or commentary. "
+        "Preserve names, technical terms, and speaker turns as spoken."
+    )
+    system = "You are a precise speech transcription engine."
+
+    with tempfile.TemporaryDirectory(prefix="sr_gemini_chunks_") as tmp:
+        workdir = Path(tmp)
+        chunks = split_audio(audio_path, settings.transcribe_chunk_seconds, workdir)
+        if not chunks:
+            raise RuntimeError(f"no audio chunks produced from {audio_path}")
+
+        chunk_durations = [probe_duration(c) for c in chunks]
+        decodable = sum(chunk_durations)
+        if expected_duration and decodable < expected_duration * 0.9:
+            raise TruncatedAudioError(
+                f"truncated audio: only {decodable:.0f}s decodable of expected "
+                f"{expected_duration:.0f}s ({decodable / expected_duration:.0%}); "
+                "the download is incomplete — will retry"
+            )
+        if tracker is not None:
+            tracker.set_chunks(len(chunks))
+
+        segments: list[dict] = []
+        offset = 0.0
+        for idx, chunk in enumerate(chunks):
+            text = _transcribe_gemini_chunk(
+                chunk, settings, tracker, limiter, model=model, prompt=prompt, system=system,
+            )
+            duration = chunk_durations[idx]
+            segments.append({
+                "start": round(offset, 2),
+                "end": round(offset + duration, 2),
+                "text": text,
+            })
+            offset += duration
+            if tracker is not None:
+                tracker.chunk_progress(idx + 1)
+
+    return TranscribeResult(
+        language=settings.default_language or None,
+        segments=segments,
+        text="\n".join(s["text"] for s in segments),
+    )
+
+
+def _transcribe_gemini_chunk(
+    chunk: Path, settings, tracker: StageTracker | None, limiter: RateLimiter,
+    *, model: str, prompt: str, system: str,
+) -> str:
+    """Keep completed chunks across retries, without exposing a partial transcript."""
+    from app.llm import generate_with_audio
+
+    audio = chunk.read_bytes()
+    digest = hashlib.sha256()
+    digest.update(json.dumps([model, prompt, system]).encode())
+    digest.update(audio)
+    cache_dir = settings.data_dir / "transcription-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{digest.hexdigest()}.json"
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text())
+            if isinstance(cached.get("text"), str) and cached["text"].strip():
+                return cached["text"]
+        except (ValueError, AttributeError):
+            logger.warning("ignoring invalid transcription cache %s", cache_path.name)
+
+    backoff = 2.0
+    for attempt in range(settings.transcribe_max_retries):
+        limiter.wait()
+        start = time.monotonic()
+        try:
+            result = generate_with_audio(
+                prompt, base64.b64encode(audio).decode("ascii"), "mp3",
+                system=system, model=model,
+            )
+        except httpx.HTTPError as exc:
+            response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
+            code = response.status_code if response is not None else None
+            if tracker is not None:
+                tracker.record_call(
+                    provider="litellm", model=model, endpoint="/chat/completions",
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                    status_code=code, is_429=code == 429,
+                )
+            if code is not None and code != 429 and code < 500:
+                raise
+            # A daily quota cannot be fixed by a short retry. Keep completed
+            # chunks for a later job instead of repeatedly spending them again.
+            daily_quota = response is not None and (
+                "requests per day" in response.text.lower()
+                or "perday" in response.text.lower()
+                or "daily quota" in response.text.lower()
+            )
+            retry_after = response.headers.get("retry-after", "") if response is not None else ""
+            try:
+                delay = max(backoff, float(retry_after))
+            except ValueError:
+                delay = backoff
+            if daily_quota or delay > 300:
+                raise RuntimeError(
+                    f"Gemini audio quota exhausted for {model}; completed chunks are saved"
+                ) from exc
+            if attempt + 1 == settings.transcribe_max_retries:
+                raise
+            logger.warning(
+                "Gemini audio HTTP %s on %s; retry in %.1fs", code, chunk.name, delay,
+            )
+            time.sleep(delay)
+            backoff = min(backoff * 2, 60.0)
+            continue
+
+        if tracker is not None:
+            tracker.record_call(
+                provider="litellm", model=model, endpoint="/chat/completions",
+                latency_ms=result.latency_ms, status_code=200,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens, tokens=result.total_tokens,
+            )
+        text = result.text.strip()
+        if not text:
+            raise RuntimeError(f"Gemini returned empty transcript for {chunk.name}")
+        if result.finish_reason not in (None, "stop"):
+            raise RuntimeError(
+                f"Gemini transcript incomplete for {chunk.name}: {result.finish_reason}"
+            )
+        if re.search(r"(\S)\1{30,}", text):
+            raise RuntimeError(f"Gemini returned repetitive transcript for {chunk.name}")
+        # Write atomically so an interrupted worker cannot leave a partial cache.
+        with tempfile.NamedTemporaryFile(mode="w", dir=cache_dir, delete=False) as out:
+            json.dump({"text": text}, out, ensure_ascii=False)
+            temporary = Path(out.name)
+        temporary.replace(cache_path)
+        return text
+    raise RuntimeError("Gemini transcription requires at least one attempt")
 
 
 def _transcribe_chunk(

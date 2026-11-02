@@ -22,6 +22,7 @@ class LlmResult:
     completion_tokens: int = 0
     total_tokens: int = 0
     latency_ms: int = 0
+    finish_reason: str | None = None
 
 
 def _endpoint() -> str:
@@ -47,6 +48,7 @@ def _parse(data: dict, latency_ms: int) -> LlmResult:
         completion_tokens=int(usage.get("completion_tokens", 0) or 0),
         total_tokens=int(usage.get("total_tokens", 0) or 0),
         latency_ms=latency_ms,
+        finish_reason=data["choices"][0].get("finish_reason"),
     )
 
 
@@ -73,7 +75,8 @@ def generate_text(
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     start = time.monotonic()
-    with httpx.Client(timeout=300) as client:
+    # The existing model proxy permits up to nine minutes per completion.
+    with httpx.Client(timeout=600) as client:
         resp = client.post(_endpoint(), json=payload, headers=_headers())
         resp.raise_for_status()
         data = resp.json()
